@@ -18,31 +18,37 @@ def fetch_products():
         page = browser.new_page(user_agent=UA)
         log("浏览器已启动，开始加载页面...")
         page.goto(START_URL, timeout=TIMEOUT_SEC * 1000)
-        
-        # ✅ 等待商品渲染出来
-        try:
-            page.wait_for_selector("li.product-tile", timeout=10000)
-            log("检测到商品元素，开始解析...")
-        except:
-            log("等待商品元素超时，可能没有结果。")
-        
+
+        # 滚动到底部加载所有商品
+        log("开始滚动页面以加载全部商品...")
+        prev_height = 0
+        while True:
+            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            time.sleep(1.5)
+            curr_height = page.evaluate("document.body.scrollHeight")
+            if curr_height == prev_height:
+                break
+            prev_height = curr_height
+        log("页面滚动完成，开始解析 HTML...")
+
         html = page.content()
         browser.close()
 
         soup = BeautifulSoup(html, "html.parser")
-        items = soup.select("li.product-tile")
+        items = soup.select("div.product__details")  # 改成实际存在的商品容器
 
         log(f"找到 {len(items)} 个商品")
         for idx, item in enumerate(items, start=1):
-            title = item.get("data-name") or item.select_one("a.name-link")
-            title_text = title.get_text(strip=True) if title and hasattr(title, "get_text") else "(no title)"
-            price = item.get("data-price", "").strip()
-            sale_price = item.get("data-sale-price", "").strip()
-            regular_price = item.get("data-regular-price", "").strip()
-            link = item.select_one("a.name-link")
-            link_url = "https://www.sportsexperts.ca" + link.get("href") if link else "(no link)"
+            title_el = item.select_one(".product__name")
+            title_text = title_el.get_text(strip=True) if title_el else "(no title)"
+            price_el = item.select_one("[data-price], [data-sale-price], [data-regular-price]")
+            price_text = price_el.get_text(strip=True) if price_el else "N/A"
+            orig_price_el = item.select_one("[data-regular-price]")
+            orig_price_text = orig_price_el.get_text(strip=True) if orig_price_el else "N/A"
+            link_el = item.find_parent("a")
+            link_url = "https://www.sportsexperts.ca" + link_el.get("href") if link_el else "(no link)"
 
-            log(f"{idx}. {title_text} | 当前价: {sale_price or price} | 原价: {regular_price or price} | 链接: {link_url}")
+            log(f"{idx}. {title_text} | 当前价: {price_text} | 原价: {orig_price_text} | 链接: {link_url}")
 
 def main():
     log(f"启动监控脚本 | start={START_URL} | interval={INTERVAL_SEC}s | timeout={TIMEOUT_SEC}s")
