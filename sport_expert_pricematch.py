@@ -150,8 +150,7 @@ def quick_get(url: str) -> Optional[str]:
 # ---------- JS展开发（Playwright） ----------
 def expand_page_with_playwright(start_url: str) -> Optional[str]:
     """
-    用 Playwright 打开页面 -> 不停滚动并点击“Show More”直到没有按钮 -> 返回最终 HTML。
-    若 Playwright 不可用或报错，返回 None。
+    用 Playwright 打开页面 -> 等待商品名加载 -> 不停滚动并点击“Show More”直到没有按钮 -> 返回最终 HTML。
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -165,18 +164,27 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
             page = context.new_page()
             page.set_default_timeout(max(4000, TIMEOUT * 1000))
 
+            print("[playwright] 打开页面...")
             page.goto(start_url, wait_until="networkidle")
+
+            # ★ 方案1：等待商品名元素加载出来（最多 15 秒）
+            try:
+                page.wait_for_selector(
+                    'a.name-link, .product-name, .product__title, .product-title, [class*="title"], [class*="name"]',
+                    timeout=15000
+                )
+                print("[playwright] 商品名元素已加载。")
+            except PWTimeout:
+                print("[playwright] 警告：未等到商品名元素，继续执行。")
 
             last_height = 0
             stable_rounds = 0
             clicked_rounds = 0
 
             def page_item_count():
-                # 常见商品块：尽量宽松
                 return page.locator('[data-product-id], [class*="product-card"], [class*="product-item"]').count()
 
             while True:
-                # 尝试点击 "Show More"（大小写、前后空格都容忍）
                 clicked = False
                 for sel in [
                     'text=/^\\s*Show\\s*More\\s*$/i',
@@ -190,26 +198,21 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
                             page.locator(sel).first.click()
                             clicked = True
                             clicked_rounds += 1
-                            # 等待新增内容或网络空闲
                             try:
                                 page.wait_for_load_state("networkidle", timeout=5000)
                             except PWTimeout:
                                 pass
-                            # 简单等待DOM更新
                             page.wait_for_timeout(600)
                             after = page_item_count()
                             if after <= before:
-                                # 有的站点是异步append，稍等再看
                                 page.wait_for_timeout(800)
                             break
                     except Exception:
                         pass
 
-                # 滚动到底部，触发懒加载
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                 page.wait_for_timeout(600)
 
-                # 判断页面高度是否不再增长
                 curr_height = page.evaluate("document.body.scrollHeight")
                 if curr_height <= last_height:
                     stable_rounds += 1
@@ -217,13 +220,9 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
                     stable_rounds = 0
                 last_height = curr_height
 
-                # 退出条件：
-                # 1) 连续多次高度不变（例如2~3次）；且
-                # 2) 本轮未点击到 Show More
                 if stable_rounds >= 3 and not clicked:
                     break
 
-            # 最终HTML
             html = page.content()
             context.close()
             browser.close()
@@ -231,6 +230,7 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
     except Exception as e:
         print(f"[playwright] error: {e}")
         return None
+
 
 # ---------- 回退：老的翻页requests ----------
 def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
