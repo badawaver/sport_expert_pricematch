@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 START_URL  = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx").strip()
 TIMEOUT    = int(os.getenv("TIMEOUT", "12"))          # 每个请求的超时（秒）
 INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))   # 轮询间隔（秒）
-MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 仅在回退requests模式时使用
+MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 回退 requests 模式时最多翻页数
 UA         = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 WEBHOOK    = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -25,6 +25,7 @@ session.headers.update({
 
 money_pat = re.compile(r"(?:\$|C?\s*\$)\s*([0-9]+(?:[.,][0-9]{2})?)")
 
+
 def to_cents(s: str) -> int:
     s = s.replace(",", "").strip()
     if "." in s:
@@ -32,7 +33,8 @@ def to_cents(s: str) -> int:
         return int(d) * 100 + int(c[:2].ljust(2, "0"))
     return int(float(s) * 100)
 
-# --------- 价格提取（加速&稳健）---------
+
+# --------- 价格提取 ---------
 def extract_prices_from_tag(tag) -> List[int]:
     texts = []
     for sel in (
@@ -58,6 +60,7 @@ def extract_prices_from_tag(tag) -> List[int]:
                 pass
     return sorted(set(amounts))
 
+
 def find_product_cards(soup: BeautifulSoup):
     cards = soup.select(
         '[class*="product-card"], [class*="product-tile"], [class*="product-item"], '
@@ -66,6 +69,7 @@ def find_product_cards(soup: BeautifulSoup):
     if cards:
         return cards
     return soup.select('li, article, div')
+
 
 def get_product_info(card, base_url):
     url = ""
@@ -80,6 +84,7 @@ def get_product_info(card, base_url):
             name = name_el.get_text(" ", strip=True)
     prices = extract_prices_from_tag(card)
     return {"name": name or "(no title)", "url": url, "prices": prices}
+
 
 def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     link = soup.find("a", rel=lambda v: v and "next" in v.lower(), href=True)
@@ -98,6 +103,7 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def quick_get(url: str) -> Optional[str]:
     for i in range(2):
         try:
@@ -111,36 +117,54 @@ def quick_get(url: str) -> Optional[str]:
             time.sleep(0.5)
     return None
 
-# ---------- JS展开发（Playwright） ----------
+
+# ---------- JS展开发（Playwright，增强版） ----------
 def expand_page_with_playwright(start_url: str) -> Optional[str]:
-    """
-    用 Playwright 打开页面 -> 不停滚动并点击“Show More”直到没有按钮 -> 返回最终 HTML。
-    若 Playwright 不可用或报错，返回 None。
-    """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except Exception:
         return None
 
+    MAX_ROUNDS = int(os.getenv("MAX_SHOW_MORE", "30"))
+    OVERALL_MS = int(os.getenv("PW_OVERALL_MS", "60000"))
+    IDLE_ROUNDS = 3
+
+    start_ts = time.time()
+
+    def expired():
+        return (time.time() - start_ts) * 1000 > OVERALL_MS
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900})
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(
+                user_agent=UA,
+                viewport={"width": 1366, "height": 900}
+            )
             page = context.new_page()
             page.set_default_timeout(max(4000, TIMEOUT * 1000))
 
-            page.goto(start_url, wait_until="networkidle")
+            print("[pw] 打开页面…")
+            page.goto(start_url, wait_until="domcontentloaded")
 
             last_height = 0
             stable_rounds = 0
-            clicked_rounds = 0
 
             def page_item_count():
-                # 常见商品块：尽量宽松
                 return page.locator('[data-product-id], [class*="product-card"], [class*="product-item"]').count()
 
-            while True:
-                # 尝试点击 "Show More"（大小写、前后空格都容忍）
+            for round_i in range(1, MAX_ROUNDS + 1):
+                if expired():
+                    print(f"[pw] 超过总超时 {OVERALL_MS} ms，停止。")
+                    break
+
+                items_before = page_item_count()
+                print(f"[pw] 轮次 {round_i}：当前商品数 ~ {items_before}")
+
+                # 点击 Show More
                 clicked = False
                 for sel in [
                     'text=/^\\s*Show\\s*More\\s*$/i',
@@ -149,52 +173,48 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
                     '[title*="Show More" i]'
                 ]:
                     try:
-                        if page.locator(sel).first.is_visible():
-                            before = page_item_count()
-                            page.locator(sel).first.click()
+                        loc = page.locator(sel).first
+                        if loc.is_visible() and loc.is_enabled():
+                            print(f"[pw] 点击按钮: {sel}")
+                            loc.click()
                             clicked = True
-                            clicked_rounds += 1
-                            # 等待新增内容或网络空闲
                             try:
-                                page.wait_for_load_state("networkidle", timeout=5000)
+                                page.wait_for_load_state("networkidle", timeout=4000)
                             except PWTimeout:
                                 pass
-                            # 简单等待DOM更新
-                            page.wait_for_timeout(600)
-                            after = page_item_count()
-                            if after <= before:
-                                # 有的站点是异步append，稍等再看
-                                page.wait_for_timeout(800)
+                            page.wait_for_timeout(500)
                             break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[pw] 点击失败: {sel} ({e})")
 
-                # 滚动到底部，触发懒加载
+                # 滚动到底部
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(500)
 
-                # 判断页面高度是否不再增长
+                items_after = page_item_count()
                 curr_height = page.evaluate("document.body.scrollHeight")
+                print(f"[pw] 高度={curr_height}, 商品数 {items_before} -> {items_after}, 点击={clicked}")
+
                 if curr_height <= last_height:
                     stable_rounds += 1
                 else:
                     stable_rounds = 0
                 last_height = curr_height
 
-                # 退出条件：
-                # 1) 连续多次高度不变（例如2~3次）；且
-                # 2) 本轮未点击到 Show More
-                if stable_rounds >= 3 and not clicked:
+                if stable_rounds >= IDLE_ROUNDS and not clicked:
+                    print("[pw] 页面稳定且无按钮，退出循环。")
                     break
 
-            # 最终HTML
             html = page.content()
             context.close()
             browser.close()
+            print("[pw] 展开完成，返回 HTML。")
             return html
+
     except Exception as e:
         print(f"[playwright] error: {e}")
         return None
+
 
 # ---------- 回退：老的翻页requests ----------
 def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
@@ -225,12 +245,13 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
         page_url = next_url
     return items
 
+
 # ---------- 统一：先JS展开，再解析 ----------
 def scan_items(start_url: str) -> list:
-    """
-    先尝试用Playwright把所有“Show More”点到尽头，再解析；
-    若失败，则回退到requests的分页抓取。
-    """
+    if os.getenv("DISABLE_PLAYWRIGHT") == "1":
+        print("[info] DISABLE_PLAYWRIGHT=1 -> using requests pagination")
+        return scan_all_pages_via_requests(start_url, MAX_PAGES)
+
     html = expand_page_with_playwright(start_url)
     items = []
     if html:
@@ -243,9 +264,9 @@ def scan_items(start_url: str) -> list:
             items.append(info)
         return items
 
-    # 回退
     print("[info] Playwright unavailable, falling back to requests pagination.")
     return scan_all_pages_via_requests(start_url, MAX_PAGES)
+
 
 def choose_current_vs_original(prices_cents: List[int]) -> Optional[Tuple[int, int]]:
     uniq = sorted(set(prices_cents))
@@ -254,8 +275,10 @@ def choose_current_vs_original(prices_cents: List[int]) -> Optional[Tuple[int, i
     current, original = min(uniq), max(uniq)
     return (current, original) if current < original else None
 
+
 def fmt_cents(cents: int) -> str:
     return f"${cents/100:.2f}"
+
 
 def to_lines(on_sale: list) -> List[str]:
     lines = [f"Sports Expert共发现 {len(on_sale)} 个商品价格低于原价：", ""]
@@ -264,9 +287,9 @@ def to_lines(on_sale: list) -> List[str]:
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
         lines.append(f"    源网站: {it['url']}")
         lines.append("")
-    # 末尾保留一个空行（不输出网站链接）
     lines.append("")
     return lines
+
 
 def post_discord(content: str):
     if not WEBHOOK:
@@ -277,6 +300,7 @@ def post_discord(content: str):
             print(f"[webhook] failed {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         print(f"[webhook] error: {e}")
+
 
 def run_once():
     items = scan_items(START_URL)
@@ -320,6 +344,7 @@ def run_once():
         for c in chunks:
             post_discord(c.strip())
 
+
 def main_loop():
     print(f"[boot] start={START_URL} | interval={INTERVAL}s | timeout={TIMEOUT}s | ua={UA[:25]}...")
     while True:
@@ -328,6 +353,7 @@ def main_loop():
         except Exception as e:
             print(f"[fatal] {e}")
         time.sleep(max(10, INTERVAL))
+
 
 if __name__ == "__main__":
     main_loop()
