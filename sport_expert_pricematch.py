@@ -70,16 +70,52 @@ def find_product_cards(soup: BeautifulSoup):
 def get_product_info(card, base_url):
     url = ""
     name = ""
+
+    # 1. 优先找链接
     a = card.find("a", href=True)
     if a:
         url = urljoin(base_url, a["href"])
-        name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+        # 有 title 属性优先用
+        if a.has_attr("title") and a["title"].strip():
+            name = a["title"].strip()
+        else:
+            # 如果 a 内部有文字且不只是空格/图片
+            text = a.get_text(" ", strip=True)
+            if text and not re.fullmatch(r"\s*", text):
+                name = text
+
+    # 2. 如果没找到，尝试找常见标题元素
     if not name:
-        name_el = card.select_one('h1, h2, h3, [class*="title"], [class*="name"]')
+        name_el = card.select_one(
+            '.product-name, .product__title, .product-title, '
+            '[class*="title"], [class*="name"], h1, h2, h3'
+        )
         if name_el:
             name = name_el.get_text(" ", strip=True)
+
+    # 3. 如果还没有，尝试去详情页抓一次（保证最后不为空）
+    if not name and url:
+        try:
+            detail_html = quick_get(url)
+            if detail_html:
+                detail_soup = BeautifulSoup(detail_html, "html.parser")
+                title_el = detail_soup.select_one(
+                    '.product-name, .product__title, .product-title, '
+                    '[class*="title"], [class*="name"], h1, h2, h3'
+                )
+                if title_el:
+                    name = title_el.get_text(" ", strip=True)
+        except Exception:
+            pass
+
+    # 4. 提取价格
     prices = extract_prices_from_tag(card)
-    return {"name": name or "(no title)", "url": url, "prices": prices}
+
+    return {
+        "name": name or "(no title)",
+        "url": url,
+        "prices": prices
+    }
 
 def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     link = soup.find("a", rel=lambda v: v and "next" in v.lower(), href=True)
