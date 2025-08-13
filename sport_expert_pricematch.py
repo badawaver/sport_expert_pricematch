@@ -177,11 +177,10 @@ def to_lines(on_sale: list) -> List[str]:
     for i, it in enumerate(on_sale, 1):
         lines.append(f"{i:>2}. {it['name']}")
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
-        lines.append(f"    {it['url']}")
+        lines.append(f"    源网站: {it['url']}")
         lines.append("")
-    # 末尾加空行，然后加“网站链接：{START_URL}”
+    # 末尾加一个空行，不再输出网站链接
     lines.append("")
-    lines.append(f"网站链接：{START_URL}")
     return lines
 
 def post_discord(content: str):
