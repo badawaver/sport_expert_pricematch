@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 START_URL  = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx").strip()
 TIMEOUT    = int(os.getenv("TIMEOUT", "12"))          # 每个请求的超时（秒）
 INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))   # 轮询间隔（秒）
-MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 仅在回退requests模式时使用
+MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 回退requests模式最大页数
 UA         = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 WEBHOOK    = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -32,7 +32,7 @@ def to_cents(s: str) -> int:
         return int(d) * 100 + int(c[:2].ljust(2, "0"))
     return int(float(s) * 100)
 
-# --------- 价格提取（加速&稳健）---------
+# --------- 价格提取 ---------
 def extract_prices_from_tag(tag) -> List[int]:
     texts = []
     for sel in (
@@ -67,44 +67,23 @@ def find_product_cards(soup: BeautifulSoup):
         return cards
     return soup.select('li, article, div')
 
-# -------- 修正版：获取商品信息 --------
 def get_product_info(card, base_url):
     url = ""
     name = ""
 
-    # 1. 列表页尝试获取链接和标题
     a = card.find("a", href=True)
     if a:
         url = urljoin(base_url, a["href"])
+        # 优先 title 属性，否则取文本
         name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
 
-    # 2. 如果没获取到标题，尝试更多 class 名称
     if not name:
-        name_el = card.select_one(
-            'h1, h2, h3, '
-            '[class*="title"], [class*="name"], '
-            '[class*="product-name"], [class*="product__name"], '
-            '[class*="product-tile__name"], [class*="productName"]'
-        )
+        name_el = card.select_one('h1, h2, h3, [class*="title"], [class*="name"], .product__title, .product-title')
         if name_el:
             name = name_el.get_text(" ", strip=True)
 
-    # 3. 如果还没获取到标题，并且有 URL，就去详情页兜底
-    if not name and url:
-        try:
-            detail_html = quick_get(url)
-            if detail_html:
-                detail_soup = BeautifulSoup(detail_html, "html.parser")
-                title_tag = detail_soup.select_one(
-                    'h1, h2, [class*="title"], [class*="name"], '
-                    '[class*="product-name"], [class*="product__name"]'
-                )
-                if title_tag:
-                    name = title_tag.get_text(" ", strip=True)
-        except Exception:
-            pass
-
-    return {"name": name or "(no title)", "url": url, "prices": extract_prices_from_tag(card)}
+    prices = extract_prices_from_tag(card)
+    return {"name": name or "(no title)", "url": url, "prices": prices}
 
 def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     link = soup.find("a", rel=lambda v: v and "next" in v.lower(), href=True)
@@ -136,7 +115,7 @@ def quick_get(url: str) -> Optional[str]:
             time.sleep(0.5)
     return None
 
-# ---------- JS展开发（Playwright） ----------
+# ---------- JS展开 ----------
 def expand_page_with_playwright(start_url: str) -> Optional[str]:
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -214,8 +193,6 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
         if not html:
             break
         soup = BeautifulSoup(html, "html.parser")
-        if "$" not in soup.get_text() and not soup.select('[data-product-id], [class*="product"]'):
-            break
         cards = find_product_cards(soup)
         if not cards:
             break
@@ -230,6 +207,7 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
         page_url = next_url
     return items
 
+# ---------- 扫描 ----------
 def scan_items(start_url: str) -> list:
     html = expand_page_with_playwright(start_url)
     items = []
@@ -242,7 +220,6 @@ def scan_items(start_url: str) -> list:
                 continue
             items.append(info)
         return items
-
     print("[info] Playwright unavailable, falling back to requests pagination.")
     return scan_all_pages_via_requests(start_url, MAX_PAGES)
 
@@ -320,12 +297,18 @@ def run_once():
 
 def main_loop():
     print(f"[boot] start={START_URL} | interval={INTERVAL}s | timeout={TIMEOUT}s | ua={UA[:25]}...")
+    # 启动先跑一次
+    try:
+        run_once()
+    except Exception as e:
+        print(f"[fatal] {e}")
+    # 按间隔循环
     while True:
+        time.sleep(max(10, INTERVAL))
         try:
             run_once()
         except Exception as e:
             print(f"[fatal] {e}")
-        time.sleep(max(10, INTERVAL))
 
 if __name__ == "__main__":
     main_loop()
