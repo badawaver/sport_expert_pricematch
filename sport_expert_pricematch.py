@@ -9,8 +9,8 @@ from bs4 import BeautifulSoup
 
 # ============ 环境变量 ============
 START_URL  = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx").strip()
-TIMEOUT    = int(os.getenv("TIMEOUT", "12"))          # 每个请求的超时（秒）
-INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))   # 轮询间隔（秒）
+TIMEOUT    = int(os.getenv("TIMEOUT", "12"))
+INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))
 MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))
 UA         = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 WEBHOOK    = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -57,22 +57,26 @@ def extract_prices_from_tag(tag) -> List[int]:
                 pass
     return sorted(set(amounts))
 
-# 新的商品卡片定位逻辑
 def find_product_cards(soup: BeautifulSoup):
-    cards = []
-    for a in soup.select('a[data-qa="search-product-title"]'):
-        card = a.find_parent(['li', 'article', 'div'])
-        if card and card not in cards:
-            cards.append(card)
-    return cards
+    cards = soup.select(
+        '[class*="product-card"], [class*="product-tile"], [class*="product-item"], '
+        '[data-product-id], [data-sku], li[class*="product"], article[class*="product"]'
+    )
+    if cards:
+        return cards
+    return soup.select('li, article, div')
 
 def get_product_info(card, base_url):
-    a = card.select_one('a[data-qa="search-product-title"]')
-    if not a:
-        return {"name": "(no title)", "url": "", "prices": []}
-
-    url = urljoin(base_url, a.get("href", "").strip())
-    name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+    url = ""
+    name = ""
+    a = card.find("a", href=True)
+    if a:
+        url = urljoin(base_url, a["href"])
+        name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+    if not name:
+        name_el = card.select_one('h1, h2, h3, [class*="title"], [class*="name"]')
+        if name_el:
+            name = name_el.get_text(" ", strip=True)
     prices = extract_prices_from_tag(card)
     return {"name": name or "(no title)", "url": url, "prices": prices}
 
@@ -96,13 +100,11 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
 def quick_get(url: str) -> Optional[str]:
     for i in range(2):
         try:
-            print(f"[http] GET {url}")
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code >= 400:
                 return None
             return r.text
-        except requests.RequestException as e:
-            print(f"[error] Request failed: {e}")
+        except requests.RequestException:
             if i == 1:
                 return None
             time.sleep(0.5)
@@ -121,50 +123,32 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
             page = context.new_page()
             page.set_default_timeout(max(4000, TIMEOUT * 1000))
 
-            print(f"[playwright] goto {start_url}")
             page.goto(start_url, wait_until="networkidle")
 
-            last_height = 0
-            stable_rounds = 0
             while True:
-                clicked = False
-                for sel in [
-                    'text=/^\\s*Show\\s*More\\s*$/i',
-                    'button:has-text("Show More")',
-                    '[aria-label*="Show More" i]',
-                    '[title*="Show More" i]'
-                ]:
-                    try:
-                        if page.locator(sel).first.is_visible():
-                            print("[playwright] Click 'Show More'")
-                            page.locator(sel).first.click()
-                            clicked = True
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=5000)
-                            except PWTimeout:
-                                pass
-                            page.wait_for_timeout(600)
-                            break
-                    except Exception:
-                        pass
+                try:
+                    btn = page.locator('button:has-text("Show More"), [aria-label*="Show More" i]').first
+                    if btn.is_visible() and btn.is_enabled():
+                        print("[playwright] Click 'Show More'")
+                        btn.click()
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except PWTimeout:
+                            pass
+                        page.wait_for_timeout(800)
+                    else:
+                        print("[playwright] No more 'Show More' button or disabled")
+                        break
+                except Exception:
+                    print("[playwright] No 'Show More' button found")
+                    break
 
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                 page.wait_for_timeout(600)
 
-                curr_height = page.evaluate("document.body.scrollHeight")
-                if curr_height <= last_height:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
-                last_height = curr_height
-
-                if stable_rounds >= 3 and not clicked:
-                    break
-
             html = page.content()
             context.close()
             browser.close()
-            print("[playwright] page expanded")
             return html
     except Exception as e:
         print(f"[playwright] error: {e}")
@@ -182,6 +166,8 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
         if not html:
             break
         soup = BeautifulSoup(html, "html.parser")
+        if "$" not in soup.get_text() and not soup.select('[data-product-id], [class*="product"]'):
+            break
         cards = find_product_cards(soup)
         if not cards:
             break
@@ -197,7 +183,6 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
     return items
 
 def scan_items(start_url: str) -> list:
-    print(f"[scan] start scanning {start_url}")
     html = expand_page_with_playwright(start_url)
     items = []
     if html:
@@ -209,8 +194,7 @@ def scan_items(start_url: str) -> list:
                 continue
             items.append(info)
         return items
-
-    print("[scan] Playwright failed, fallback to requests")
+    print("[info] Playwright unavailable, falling back to requests pagination.")
     return scan_all_pages_via_requests(start_url, MAX_PAGES)
 
 def choose_current_vs_original(prices_cents: List[int]) -> Optional[Tuple[int, int]]:
@@ -244,13 +228,11 @@ def post_discord(content: str):
         print(f"[webhook] error: {e}")
 
 def run_once():
-    print("[run] start")
     items = scan_items(START_URL)
-    print(f"[run] found {len(items)} items")
     if not items:
-        msg = "未抓到任何商品"
+        msg = "未抓到任何商品（可能该页是JS渲染且受反爬/或页面结构变动）。"
         print(msg)
-        post_discord(msg)
+        post_discord(msg if WEBHOOK else "")
         return
 
     on_sale = []
@@ -268,7 +250,7 @@ def run_once():
     if not on_sale:
         msg = "未发现“当前价 ≠ 原价”的商品。"
         print(msg)
-        post_discord(msg)
+        post_discord(msg if WEBHOOK else "")
         return
 
     on_sale.sort(key=lambda x: (x["original"] - x["current"]), reverse=True)
@@ -276,24 +258,25 @@ def run_once():
     text = "\n".join(lines)
     print(text)
     if WEBHOOK:
-        buf = ""
+        chunks, buf = [], ""
         for line in lines:
             if len(buf) + len(line) + 1 > 1800:
-                post_discord(buf.strip())
+                chunks.append(buf)
                 buf = ""
-            buf += line + "\n"
+            buf += (line + "\n")
         if buf:
-            post_discord(buf.strip())
+            chunks.append(buf)
+        for c in chunks:
+            post_discord(c.strip())
 
 def main_loop():
     print(f"[boot] start={START_URL} | interval={INTERVAL}s | timeout={TIMEOUT}s | ua={UA[:25]}...")
-    run_once()  # 启动后立即执行一次
     while True:
         try:
-            time.sleep(max(10, INTERVAL))
             run_once()
         except Exception as e:
             print(f"[fatal] {e}")
+        time.sleep(max(10, INTERVAL))
 
 if __name__ == "__main__":
     main_loop()
