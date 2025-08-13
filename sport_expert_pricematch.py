@@ -37,7 +37,7 @@ def extract_prices_from_tag(tag) -> List[int]:
     texts = []
     for sel in (
         '[class*="price"]', '[class*="sale"]', '[class*="regular"]',
-        '[data-price]', '[data-sale-price]', '[data-regular-price]',
+        '[data-price]', '[data-sale-price]', '[data-regular-price]`,
         '.product__price', '.price__value', '.product-price', '.product__pricing'
     ):
         for el in tag.select(sel):
@@ -74,7 +74,6 @@ def get_product_info(card, base_url):
     a = card.find("a", href=True)
     if a:
         url = urljoin(base_url, a["href"])
-        # 优先 title 属性，否则取文本
         name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
 
     if not name:
@@ -105,11 +104,14 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
 def quick_get(url: str) -> Optional[str]:
     for i in range(2):
         try:
+            print(f"[requests] GET {url}")
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code >= 400:
+                print(f"[requests] status {r.status_code}")
                 return None
             return r.text
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"[requests] error: {e}")
             if i == 1:
                 return None
             time.sleep(0.5)
@@ -119,17 +121,21 @@ def quick_get(url: str) -> Optional[str]:
 def expand_page_with_playwright(start_url: str) -> Optional[str]:
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except Exception:
+    except Exception as e:
+        print(f"[playwright] import error: {e}")
         return None
 
     try:
+        print(f"[playwright] launching Chromium for {start_url}")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900})
             page = context.new_page()
             page.set_default_timeout(max(4000, TIMEOUT * 1000))
 
+            print("[playwright] opening page...")
             page.goto(start_url, wait_until="networkidle")
+            print("[playwright] page opened, start scrolling...")
 
             last_height = 0
             stable_rounds = 0
@@ -144,17 +150,14 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
                 ]:
                     try:
                         if page.locator(sel).first.is_visible():
-                            before = page.locator('[data-product-id], [class*="product-card"], [class*="product-item"]').count()
+                            print(f"[playwright] clicking: {sel}")
                             page.locator(sel).first.click()
-                            clicked = True
                             try:
                                 page.wait_for_load_state("networkidle", timeout=5000)
                             except PWTimeout:
                                 pass
                             page.wait_for_timeout(600)
-                            after = page.locator('[data-product-id], [class*="product-card"], [class*="product-item"]').count()
-                            if after <= before:
-                                page.wait_for_timeout(800)
+                            clicked = True
                             break
                     except Exception:
                         pass
@@ -170,9 +173,11 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
                 last_height = curr_height
 
                 if stable_rounds >= 3 and not clicked:
+                    print("[playwright] scroll stable, stop.")
                     break
 
             html = page.content()
+            print("[playwright] HTML length:", len(html))
             context.close()
             browser.close()
             return html
@@ -182,6 +187,7 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
 
 # ---------- 回退 ----------
 def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
+    print("[fallback] using requests pagination...")
     page_url = start_url
     seen = set()
     items = []
@@ -209,18 +215,20 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
 
 # ---------- 扫描 ----------
 def scan_items(start_url: str) -> list:
+    print("[scan_items] trying Playwright...")
     html = expand_page_with_playwright(start_url)
-    items = []
     if html:
+        print("[scan_items] Playwright got HTML, parsing...")
         soup = BeautifulSoup(html, "html.parser")
         cards = find_product_cards(soup)
+        items = []
         for c in cards:
             info = get_product_info(c, start_url)
             if not info["url"] or not info["prices"]:
                 continue
             items.append(info)
         return items
-    print("[info] Playwright unavailable, falling back to requests pagination.")
+    print("[scan_items] Playwright failed, fallback to requests...")
     return scan_all_pages_via_requests(start_url, MAX_PAGES)
 
 def choose_current_vs_original(prices_cents: List[int]) -> Optional[Tuple[int, int]]:
@@ -254,7 +262,9 @@ def post_discord(content: str):
         print(f"[webhook] error: {e}")
 
 def run_once():
+    print("[run_once] start scanning items...")
     items = scan_items(START_URL)
+    print(f"[run_once] found {len(items)} items before filtering.")
     if not items:
         msg = "未抓到任何商品（可能该页是JS渲染且受反爬/或页面结构变动）。"
         print(msg)
