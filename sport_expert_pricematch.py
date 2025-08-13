@@ -173,12 +173,15 @@ def fmt_cents(cents: int) -> str:
     return f"${cents/100:.2f}"
 
 def to_lines(on_sale: list) -> List[str]:
-    lines = [f"Sport Expert共发现 {len(on_sale)} 个商品价格低于原价（最多扫描 {MAX_PAGES} 页）:", ""]
+    lines = [f"Sports Expert共发现 {len(on_sale)} 个商品价格低于原价（最多扫描 {MAX_PAGES} 页）:", ""]
     for i, it in enumerate(on_sale, 1):
         lines.append(f"{i:>2}. {it['name']}")
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
         lines.append(f"    {it['url']}")
         lines.append("")
+    # 末尾加空行，然后加“网站链接：{START_URL}”
+    lines.append("")
+    lines.append(f"网站链接：{START_URL}")
     return lines
 
 def post_discord(content: str):
@@ -243,7 +246,7 @@ def main_loop():
             run_once()
         except Exception as e:
             print(f"[fatal] {e}")
-        # 为了更像真人访问，轻微抖动
+        # 为了更像真人访问，轻微抖动（这里保持简单）
         sleep_s = INTERVAL
         time.sleep(max(10, sleep_s))
 
