@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 
 START_URL = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx")
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "1800"))
-TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "15"))
+TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "30"))
 UA = os.getenv("UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
 
 def log(msg):
