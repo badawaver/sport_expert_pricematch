@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 # ============ 环境变量 ============
 START_URL  = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx").strip()
-TIMEOUT    = int(os.getenv("TIMEOUT", "12"))          # 每个请求的超时（秒）
+TIMEOUT    = int(os.getenv("TIMEOUT", "30"))          # 每个请求的超时（秒）
 INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))   # 轮询间隔（秒）
 MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 仅在回退requests模式时使用
 UA         = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
