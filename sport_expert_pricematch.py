@@ -9,9 +9,9 @@ from bs4 import BeautifulSoup
 
 # ============ 环境变量 ============
 START_URL  = os.getenv("START_URL", "https://www.sportsexperts.ca/en-CA/search?keywords=arc%27teryx").strip()
-TIMEOUT    = int(os.getenv("TIMEOUT", "12"))
-INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))
-MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))
+TIMEOUT    = int(os.getenv("TIMEOUT", "12"))          # 每个请求的超时（秒）
+INTERVAL   = int(os.getenv("INTERVAL_SEC", "1800"))   # 轮询间隔（秒）
+MAX_PAGES  = int(os.getenv("MAX_PAGES", "5"))         # 仅在回退requests模式时使用
 UA         = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 WEBHOOK    = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -32,6 +32,7 @@ def to_cents(s: str) -> int:
         return int(d) * 100 + int(c[:2].ljust(2, "0"))
     return int(float(s) * 100)
 
+# --------- 价格提取（加速&稳健）---------
 def extract_prices_from_tag(tag) -> List[int]:
     texts = []
     for sel in (
@@ -110,7 +111,12 @@ def quick_get(url: str) -> Optional[str]:
             time.sleep(0.5)
     return None
 
+# ---------- JS展开发（Playwright） ----------
 def expand_page_with_playwright(start_url: str) -> Optional[str]:
+    """
+    用 Playwright 打开页面 -> 不停滚动并点击“Show More”直到没有按钮 -> 返回最终 HTML。
+    若 Playwright 不可用或报错，返回 None。
+    """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except Exception:
@@ -125,27 +131,63 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
 
             page.goto(start_url, wait_until="networkidle")
 
-            while True:
-                try:
-                    btn = page.locator('button:has-text("Show More"), [aria-label*="Show More" i]').first
-                    if btn.is_visible() and btn.is_enabled():
-                        print("[playwright] Click 'Show More'")
-                        btn.click()
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=5000)
-                        except PWTimeout:
-                            pass
-                        page.wait_for_timeout(800)
-                    else:
-                        print("[playwright] No more 'Show More' button or disabled")
-                        break
-                except Exception:
-                    print("[playwright] No 'Show More' button found")
-                    break
+            last_height = 0
+            stable_rounds = 0
+            clicked_rounds = 0
 
+            def page_item_count():
+                # 常见商品块：尽量宽松
+                return page.locator('[data-product-id], [class*="product-card"], [class*="product-item"]').count()
+
+            while True:
+                # 尝试点击 "Show More"（大小写、前后空格都容忍）
+                clicked = False
+                for sel in [
+                    'text=/^\\s*Show\\s*More\\s*$/i',
+                    'button:has-text("Show More")',
+                    '[aria-label*="Show More" i]',
+                    '[title*="Show More" i]'
+                ]:
+                    try:
+                        if page.locator(sel).first.is_visible():
+                            before = page_item_count()
+                            page.locator(sel).first.click()
+                            clicked = True
+                            clicked_rounds += 1
+                            # 等待新增内容或网络空闲
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=5000)
+                            except PWTimeout:
+                                pass
+                            # 简单等待DOM更新
+                            page.wait_for_timeout(600)
+                            after = page_item_count()
+                            if after <= before:
+                                # 有的站点是异步append，稍等再看
+                                page.wait_for_timeout(800)
+                            break
+                    except Exception:
+                        pass
+
+                # 滚动到底部，触发懒加载
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                 page.wait_for_timeout(600)
 
+                # 判断页面高度是否不再增长
+                curr_height = page.evaluate("document.body.scrollHeight")
+                if curr_height <= last_height:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                last_height = curr_height
+
+                # 退出条件：
+                # 1) 连续多次高度不变（例如2~3次）；且
+                # 2) 本轮未点击到 Show More
+                if stable_rounds >= 3 and not clicked:
+                    break
+
+            # 最终HTML
             html = page.content()
             context.close()
             browser.close()
@@ -154,6 +196,7 @@ def expand_page_with_playwright(start_url: str) -> Optional[str]:
         print(f"[playwright] error: {e}")
         return None
 
+# ---------- 回退：老的翻页requests ----------
 def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
     page_url = start_url
     seen = set()
@@ -182,7 +225,12 @@ def scan_all_pages_via_requests(start_url: str, max_pages: int) -> list:
         page_url = next_url
     return items
 
+# ---------- 统一：先JS展开，再解析 ----------
 def scan_items(start_url: str) -> list:
+    """
+    先尝试用Playwright把所有“Show More”点到尽头，再解析；
+    若失败，则回退到requests的分页抓取。
+    """
     html = expand_page_with_playwright(start_url)
     items = []
     if html:
@@ -194,6 +242,8 @@ def scan_items(start_url: str) -> list:
                 continue
             items.append(info)
         return items
+
+    # 回退
     print("[info] Playwright unavailable, falling back to requests pagination.")
     return scan_all_pages_via_requests(start_url, MAX_PAGES)
 
@@ -214,6 +264,7 @@ def to_lines(on_sale: list) -> List[str]:
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
         lines.append(f"    源网站: {it['url']}")
         lines.append("")
+    # 末尾保留一个空行（不输出网站链接）
     lines.append("")
     return lines
 
