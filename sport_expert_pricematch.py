@@ -44,6 +44,7 @@ def normalize_url(u: str) -> str:
 # --------- 价格提取（加速&稳健）---------
 def extract_prices_from_tag(tag) -> List[int]:
     texts = []
+    # 优先在典型价格区域取文本（比全卡片快）
     for sel in (
         '[class*="price"]', '[class*="sale"]', '[class*="regular"]',
         '[data-price]', '[data-sale-price]', '[data-regular-price]',
@@ -53,6 +54,8 @@ def extract_prices_from_tag(tag) -> List[int]:
             txt = el.get_text(" ", strip=True)
             if txt:
                 texts.append(txt)
+
+    # 兜底：整卡片文本（可能含“$89.99 $44.99”）
     if not texts:
         full_txt = tag.get_text(" ", strip=True)
         if full_txt:
@@ -74,22 +77,44 @@ def find_product_cards(soup: BeautifulSoup):
     )
     if cards:
         return cards
+    # 兜底范围（尽量少，避免拖慢）
     return soup.select('li, article, div')
+
+# --------- 商品URL识别：只接受 /p-xxx/<productId>/... 这种详情页结构，并排除促销页 ---------
+_prod_path_pat = re.compile(r"/p-[^/]+/\d{5,}(/|$)", re.I)
+
+def is_product_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        path = p.path.lower()
+        # 明确排除促销/活动等非商品页面
+        if any(seg in path for seg in ("/deals/", "/promotions", "/promo", "/spend-get")):
+            return False
+        # 需要符合 /p-xxx/<productId>/... 的结构（至少一个5位以上数字ID）
+        return bool(_prod_path_pat.search(path))
+    except Exception:
+        return False
 
 # --------- 从卡片拿“产品名/URL”（优先 Sports Experts 的锚点）---------
 def extract_name_from_card(card) -> Optional[str]:
+    """
+    优先从 a[data-qa="search-product-title"] 读取商品名；
+    没有则通用兜底（常见 name/title 容器、data/aria、img alt、a 文本等）。
+    """
     a = card.select_one('a[data-qa="search-product-title"]')
     if a:
         name = (a.get("title") or a.get("aria-label") or a.get_text(" ", strip=True) or "").strip()
         if name:
             return name
 
+    # —— 通用兜底：常见 name/title 容器 ——
     name_el = card.select_one('[itemprop="name"], [class*="name"], [class*="title"], [class*="heading"]')
     if name_el:
         txt = name_el.get_text(" ", strip=True)
         if txt:
             return txt
 
+    # data-/aria- 属性
     for attr in ("data-product-name", "data-name", "data-label", "aria-label"):
         el = card.find(attrs={attr: True})
         if el:
@@ -97,12 +122,14 @@ def extract_name_from_card(card) -> Optional[str]:
             if isinstance(val, str) and val.strip():
                 return val.strip()
 
+    # 图片 alt 里也常带产品名
     img = card.find("img", alt=True)
     if img and img.get("alt"):
         alt = img["alt"].strip()
         if alt:
             return alt
 
+    # a 标签其它属性或纯文本
     a2 = card.find("a", href=True)
     if a2:
         for attr in ("title", "aria-label", "data-name", "data-label"):
@@ -113,6 +140,7 @@ def extract_name_from_card(card) -> Optional[str]:
         if txt:
             return txt
 
+    # 标题标签兜底
     for sel in ("h1", "h2", "h3"):
         el = card.find(sel)
         if el:
@@ -122,14 +150,23 @@ def extract_name_from_card(card) -> Optional[str]:
     return None
 
 def extract_url_from_card(card, base_url: str) -> str:
+    # 优先：列表页产品锚点
     a = card.select_one('a[data-qa="search-product-title"][href]')
-    if not a:
-        a = card.find("a", href=True)
-    return urljoin(base_url, a["href"]) if a and a.get("href") else ""
+    if a:
+        u = urljoin(base_url, a["href"])
+        return u if is_product_url(u) else ""
+    # 兜底：即使用其它 <a>，也必须是“商品URL”才算数
+    a2 = card.find("a", href=True)
+    if a2:
+        u = urljoin(base_url, a2["href"])
+        return u if is_product_url(u) else ""
+    return ""
 
 def get_product_info(card, base_url):
+    # —— 先拿链接 & 名称（优先 Sports Experts 专用锚点）——
     url = extract_url_from_card(card, base_url)
     name = extract_name_from_card(card) or ""
+
     prices = extract_prices_from_tag(card)
     return {
         "name": name or "(no title)",
@@ -144,6 +181,7 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     for a in soup.select('a[href*="page="], a[aria-label*="Next"], a[title*="Next"]'):
         if "next" in a.get_text(" ", strip=True).lower():
             return urljoin(curr_url, a["href"])
+    # 猜 ?page=N
     try:
         parsed = urlparse(curr_url)
         q = parse_qs(parsed.query)
@@ -155,7 +193,8 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
         return None
 
 def quick_get(url: str) -> Optional[str]:
-    for i in range(2):
+    """带轻量重试的 GET"""
+    for i in range(2):  # 最多2次
         try:
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code >= 400:
@@ -184,6 +223,7 @@ def scan_all_pages(start_url: str, max_pages: int) -> list:
 
         soup = BeautifulSoup(html, "html.parser")
 
+        # 如果页面上几乎没有 $ 金额，且没有任何 product 卡片，极可能是 JS 渲染，直接退出
         if "$" not in soup.get_text() and not soup.select('[data-product-id], [class*="product"]'):
             break
 
@@ -193,6 +233,7 @@ def scan_all_pages(start_url: str, max_pages: int) -> list:
 
         for c in cards:
             info = get_product_info(c, page_url)
+            # 过滤非商品或无价卡片
             if not info["url"] or not info["prices"]:
                 continue
 
@@ -227,6 +268,7 @@ def to_lines(on_sale: list) -> List[str]:
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
         lines.append(f"    源网站: {it['url']}")
         lines.append("")
+    # 末尾加一个空行，不再输出网站链接
     lines.append("")
     return lines
 
@@ -282,6 +324,7 @@ def run_once():
     text = "\n".join(lines)
     print(text)
     if WEBHOOK:
+        # 控制单次消息长度，分段发
         chunks = []
         buf = ""
         for line in lines:
@@ -301,6 +344,7 @@ def main_loop():
             run_once()
         except Exception as e:
             print(f"[fatal] {e}")
+        # 为了更像真人访问，轻微抖动（这里保持简单）
         sleep_s = INTERVAL
         time.sleep(max(10, sleep_s))
 
