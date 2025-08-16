@@ -33,10 +33,17 @@ def to_cents(s: str) -> int:
         return int(d) * 100 + int(c[:2].ljust(2, "0"))
     return int(float(s) * 100)
 
+# --------- URL 规范化（用于去重）---------
+def normalize_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
+    except Exception:
+        return u
+
 # --------- 价格提取（加速&稳健）---------
 def extract_prices_from_tag(tag) -> List[int]:
     texts = []
-    # 优先在典型价格区域取文本（比全卡片快）
     for sel in (
         '[class*="price"]', '[class*="sale"]', '[class*="regular"]',
         '[data-price]', '[data-sale-price]', '[data-regular-price]',
@@ -46,8 +53,6 @@ def extract_prices_from_tag(tag) -> List[int]:
             txt = el.get_text(" ", strip=True)
             if txt:
                 texts.append(txt)
-
-    # 兜底：整卡片文本（可能含“$89.99 $44.99”）
     if not texts:
         full_txt = tag.get_text(" ", strip=True)
         if full_txt:
@@ -69,29 +74,22 @@ def find_product_cards(soup: BeautifulSoup):
     )
     if cards:
         return cards
-    # 兜底范围（尽量少，避免拖慢）
     return soup.select('li, article, div')
 
-# --------- 新增：从卡片拿“产品名”和“URL”（优先 Sports Experts 专用锚点）---------
+# --------- 从卡片拿“产品名/URL”（优先 Sports Experts 的锚点）---------
 def extract_name_from_card(card) -> Optional[str]:
-    """
-    优先从 a[data-qa="search-product-title"] 读取商品名；
-    没有则通用兜底（常见 name/title 容器、data/aria、img alt、a 文本等）。
-    """
     a = card.select_one('a[data-qa="search-product-title"]')
     if a:
         name = (a.get("title") or a.get("aria-label") or a.get_text(" ", strip=True) or "").strip()
         if name:
             return name
 
-    # —— 通用兜底：常见 name/title 容器 ——
     name_el = card.select_one('[itemprop="name"], [class*="name"], [class*="title"], [class*="heading"]')
     if name_el:
         txt = name_el.get_text(" ", strip=True)
         if txt:
             return txt
 
-    # data-/aria- 属性
     for attr in ("data-product-name", "data-name", "data-label", "aria-label"):
         el = card.find(attrs={attr: True})
         if el:
@@ -99,14 +97,12 @@ def extract_name_from_card(card) -> Optional[str]:
             if isinstance(val, str) and val.strip():
                 return val.strip()
 
-    # 图片 alt 里也常带产品名
     img = card.find("img", alt=True)
     if img and img.get("alt"):
         alt = img["alt"].strip()
         if alt:
             return alt
 
-    # a 标签其它属性或纯文本
     a2 = card.find("a", href=True)
     if a2:
         for attr in ("title", "aria-label", "data-name", "data-label"):
@@ -117,7 +113,6 @@ def extract_name_from_card(card) -> Optional[str]:
         if txt:
             return txt
 
-    # 标题标签兜底
     for sel in ("h1", "h2", "h3"):
         el = card.find(sel)
         if el:
@@ -133,10 +128,8 @@ def extract_url_from_card(card, base_url: str) -> str:
     return urljoin(base_url, a["href"]) if a and a.get("href") else ""
 
 def get_product_info(card, base_url):
-    # —— 先拿链接 & 名称（优先 Sports Experts 专用锚点）——
     url = extract_url_from_card(card, base_url)
     name = extract_name_from_card(card) or ""
-
     prices = extract_prices_from_tag(card)
     return {
         "name": name or "(no title)",
@@ -151,7 +144,6 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
     for a in soup.select('a[href*="page="], a[aria-label*="Next"], a[title*="Next"]'):
         if "next" in a.get_text(" ", strip=True).lower():
             return urljoin(curr_url, a["href"])
-    # 猜 ?page=N
     try:
         parsed = urlparse(curr_url)
         q = parse_qs(parsed.query)
@@ -163,8 +155,7 @@ def get_next_page_url(soup: BeautifulSoup, curr_url: str) -> Optional[str]:
         return None
 
 def quick_get(url: str) -> Optional[str]:
-    """带轻量重试的 GET"""
-    for i in range(2):  # 最多2次
+    for i in range(2):
         try:
             r = session.get(url, timeout=TIMEOUT)
             if r.status_code >= 400:
@@ -178,13 +169,14 @@ def quick_get(url: str) -> Optional[str]:
 
 def scan_all_pages(start_url: str, max_pages: int) -> list:
     page_url = start_url
-    seen = set()
+    seen_pages = set()
     items = []
+    seen_urls = set()  # 扫描阶段按规范化URL去重
 
     for _ in range(max_pages):
-        if not page_url or page_url in seen:
+        if not page_url or page_url in seen_pages:
             break
-        seen.add(page_url)
+        seen_pages.add(page_url)
 
         html = quick_get(page_url)
         if not html:
@@ -192,7 +184,6 @@ def scan_all_pages(start_url: str, max_pages: int) -> list:
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # 如果页面上几乎没有 $ 金额，且没有任何 product 卡片，极可能是 JS 渲染，直接退出
         if "$" not in soup.get_text() and not soup.select('[data-product-id], [class*="product"]'):
             break
 
@@ -204,6 +195,12 @@ def scan_all_pages(start_url: str, max_pages: int) -> list:
             info = get_product_info(c, page_url)
             if not info["url"] or not info["prices"]:
                 continue
+
+            norm = normalize_url(info["url"])
+            if norm in seen_urls:
+                continue
+            seen_urls.add(norm)
+
             items.append(info)
 
         next_url = get_next_page_url(soup, page_url)
@@ -224,13 +221,12 @@ def fmt_cents(cents: int) -> str:
     return f"${cents/100:.2f}"
 
 def to_lines(on_sale: list) -> List[str]:
-    lines = [f"Sports Expert共发现 {len(on_sale)} 个商品价格低于原价（最多扫描 {MAX_PAGES} 页）:", ""]
+    lines = [f"Sports Experts 共发现 {len(on_sale)} 个商品价格低于原价（最多扫描 {MAX_PAGES} 页）:", ""]
     for i, it in enumerate(on_sale, 1):
         lines.append(f"{i:>2}. {it['name']}")
         lines.append(f"    当前价: {fmt_cents(it['current'])} | 原价: {fmt_cents(it['original'])}")
         lines.append(f"    源网站: {it['url']}")
         lines.append("")
-    # 末尾加一个空行，不再输出网站链接
     lines.append("")
     return lines
 
@@ -252,23 +248,33 @@ def run_once():
         post_discord(msg if WEBHOOK else "")
         return
 
-    on_sale = []
+    raw_on_sale = []
     for it in items:
         pair = choose_current_vs_original(it["prices"])
         if pair:
             curr, orig = pair
-            on_sale.append({
+            raw_on_sale.append({
                 "name": it["name"],
                 "url": it["url"],
                 "current": curr,
                 "original": orig
             })
 
-    if not on_sale:
+    if not raw_on_sale:
         msg = "未发现“当前价 ≠ 原价”的商品。"
         print(msg)
         post_discord(msg if WEBHOOK else "")
         return
+
+    # —— 输出阶段：再次按规范化URL去重，保留折扣更大的 —— 
+    best_by_url = {}
+    for it in raw_on_sale:
+        key = normalize_url(it["url"])
+        disc = it["original"] - it["current"]
+        if key not in best_by_url or disc > (best_by_url[key]["original"] - best_by_url[key]["current"]):
+            best_by_url[key] = it
+
+    on_sale = list(best_by_url.values())
 
     # 排序：按原价-现价差额降序
     on_sale.sort(key=lambda x: (x["original"] - x["current"]), reverse=True)
@@ -276,7 +282,6 @@ def run_once():
     text = "\n".join(lines)
     print(text)
     if WEBHOOK:
-        # 控制单次消息长度，分段发
         chunks = []
         buf = ""
         for line in lines:
@@ -296,7 +301,6 @@ def main_loop():
             run_once()
         except Exception as e:
             print(f"[fatal] {e}")
-        # 为了更像真人访问，轻微抖动（这里保持简单）
         sleep_s = INTERVAL
         time.sleep(max(10, sleep_s))
 
