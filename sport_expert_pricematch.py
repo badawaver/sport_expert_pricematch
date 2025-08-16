@@ -72,19 +72,70 @@ def find_product_cards(soup: BeautifulSoup):
     # 兜底范围（尽量少，避免拖慢）
     return soup.select('li, article, div')
 
-def get_product_info(card, base_url):
-    # 链接 & 名称（先从链接，再从标题元素）
-    url = ""
-    name = ""
-    a = card.find("a", href=True)
+# --------- 新增：从卡片拿“产品名”和“URL”（优先 Sports Experts 专用锚点）---------
+def extract_name_from_card(card) -> Optional[str]:
+    """
+    优先从 a[data-qa="search-product-title"] 读取商品名；
+    没有则通用兜底（常见 name/title 容器、data/aria、img alt、a 文本等）。
+    """
+    a = card.select_one('a[data-qa="search-product-title"]')
     if a:
-        url = urljoin(base_url, a["href"])
-        name = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+        name = (a.get("title") or a.get("aria-label") or a.get_text(" ", strip=True) or "").strip()
+        if name:
+            return name
 
-    if not name:
-        name_el = card.select_one('h1, h2, h3, [class*="title"], [class*="name"]')
-        if name_el:
-            name = name_el.get_text(" ", strip=True)
+    # —— 通用兜底：常见 name/title 容器 ——
+    name_el = card.select_one('[itemprop="name"], [class*="name"], [class*="title"], [class*="heading"]')
+    if name_el:
+        txt = name_el.get_text(" ", strip=True)
+        if txt:
+            return txt
+
+    # data-/aria- 属性
+    for attr in ("data-product-name", "data-name", "data-label", "aria-label"):
+        el = card.find(attrs={attr: True})
+        if el:
+            val = el.get(attr)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    # 图片 alt 里也常带产品名
+    img = card.find("img", alt=True)
+    if img and img.get("alt"):
+        alt = img["alt"].strip()
+        if alt:
+            return alt
+
+    # a 标签其它属性或纯文本
+    a2 = card.find("a", href=True)
+    if a2:
+        for attr in ("title", "aria-label", "data-name", "data-label"):
+            v = a2.get(attr)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        txt = a2.get_text(" ", strip=True)
+        if txt:
+            return txt
+
+    # 标题标签兜底
+    for sel in ("h1", "h2", "h3"):
+        el = card.find(sel)
+        if el:
+            txt = el.get_text(" ", strip=True)
+            if txt:
+                return txt
+    return None
+
+def extract_url_from_card(card, base_url: str) -> str:
+    a = card.select_one('a[data-qa="search-product-title"][href]')
+    if not a:
+        a = card.find("a", href=True)
+    return urljoin(base_url, a["href"]) if a and a.get("href") else ""
+
+def get_product_info(card, base_url):
+    # —— 先拿链接 & 名称（优先 Sports Experts 专用锚点）——
+    url = extract_url_from_card(card, base_url)
+    name = extract_name_from_card(card) or ""
 
     prices = extract_prices_from_tag(card)
     return {
